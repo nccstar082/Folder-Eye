@@ -1,0 +1,61 @@
+name: Build and Release Folder Tool
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:
+      - 'v*' # Trigger on tags like v1.0, v2.0
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  build-windows:
+    name: Build Windows Exe
+    runs-on: windows-latest
+    
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install chardet pyinstaller
+          # If you have a requirements.txt, uncomment the next line:
+          # pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        # --onefile: Create a single .exe file
+        # --noconsole: Don't show the command prompt when running (GUI only)
+        # --name: The name of the output file
+        run: |
+          pyinstaller --onefile --windowed --name "FolderComparisonTool" --clean folder-eye.py
+
+      - name: Check Output
+        run: dir dist
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FolderComparisonTool-Windows
+          path: dist/FolderComparisonTool.exe
+          retention-days: 5
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/FolderComparisonTool.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
