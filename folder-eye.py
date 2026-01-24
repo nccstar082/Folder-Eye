@@ -15,6 +15,14 @@ import threading
 import chardet
 import re
 
+def get_app_dir(app_name="FolderComparisonTool"):
+    """获取应用程序目录，支持 exe 打包和源码运行"""
+    if getattr(sys, "frozen", False):
+        # exe 打包后，用用户可写目录
+        return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), app_name)
+    else:
+        # 源码运行
+        return os.path.dirname(os.path.abspath(__file__))
 
 class FolderComparisonTool:
     def __init__(self, root):
@@ -28,8 +36,10 @@ class FolderComparisonTool:
         
         self.style = ttk.Style()
         self.style.configure('Custom.TCheckbutton', font=self.default_font)
+
+        self.app_dir = get_app_dir()
+        os.makedirs(self.app_dir, exist_ok=True)  # 确保目录存在
         
-        self.app_dir = os.path.dirname(os.path.abspath(__file__)) if __file__ else os.getcwd()
         self.config_path = os.path.join(self.app_dir, "config.json")
         self.excluded_config_path = os.path.join(self.app_dir, "exclude_config.json")
         
@@ -1821,5 +1831,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"程序启动失败: {str(e)}")
         input("按回车键退出...")
-
-
