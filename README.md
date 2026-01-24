@@ -85,3 +85,4 @@ Output Directory/
 The tool creates local JSON files to save your preferences:
 *   `config.json`: Saves directory history.
 *   `exclude_config.json`: Saves the list of excluded folder paths.
+---------------------------------------------------------------------------------------------
