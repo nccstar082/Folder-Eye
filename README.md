@@ -3,7 +3,7 @@
 **Folder-Eye** is a powerful, Python-based graphical tool designed to audit, compare, and visualize differences between two directories. Whether you are performing code reviews, verifying backups, or tracking version changes, Folder-Eye provides a clear "eye" on exactly what has changed.
 
 [![Python](https://img.shields.io/badge/Python-3.x-blue.svg)](https://github.com/nccstar082/Folder-Eye)
-[![License](https://img.shields.io/github/license/nccstar082/Folder-Eye](https://github.com/nccstar082/Folder-Eye/blob/main/LICENSE)
+[![License](https://img.shields.io/github/license/nccstar082/Folder-Eye?color=green)](https://github.com/nccstar082/Folder-Eye/blob/main/LICENSE)
 
 ## ✨ Key Features
 
