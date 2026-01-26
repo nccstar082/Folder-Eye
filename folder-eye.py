@@ -16,12 +16,9 @@ import chardet
 import re
 
 def get_app_dir(app_name="FolderComparisonTool"):
-    """获取应用程序目录，支持 exe 打包和源码运行"""
     if getattr(sys, "frozen", False):
-        # exe 打包后，用用户可写目录
-        return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), app_name)
+        return os.path.dirname(sys.executable)
     else:
-        # 源码运行
         return os.path.dirname(os.path.abspath(__file__))
 
 class FolderComparisonTool:
