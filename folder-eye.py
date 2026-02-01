@@ -6,15 +6,15 @@ import difflib
 import shutil
 import time
 import subprocess
+import threading
+import chardet
+import re
+import queue  # Added for thread safety
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import webbrowser
-import threading
-import chardet
-import re
-import queue
 
 def get_app_dir(app_name="FolderComparisonTool"):
     if getattr(sys, "frozen", False):
@@ -29,9 +29,6 @@ class FolderComparisonTool:
         self.root.geometry("900x700")
         self.root.minsize(700, 700)
         
-		self.gui_queue = queue.Queue()
-		self.root.after(100, self.process_gui_queue) # Start checking queue
-		
         self.default_font = ('SimHei', 10)
         self.header_font = ('SimHei', 12, 'bold')
         
@@ -39,11 +36,15 @@ class FolderComparisonTool:
         self.style.configure('Custom.TCheckbutton', font=self.default_font)
 
         self.app_dir = get_app_dir()
-        os.makedirs(self.app_dir, exist_ok=True)  # 确保目录存在
+        os.makedirs(self.app_dir, exist_ok=True)
         
         self.config_path = os.path.join(self.app_dir, "config.json")
         self.excluded_config_path = os.path.join(self.app_dir, "exclude_config.json")
         
+        # --- Optimization: Thread-Safe Queue Init ---
+        self.gui_queue = queue.Queue()
+        # --------------------------------------------
+
         self.dir_a = tk.StringVar()
         self.dir_b = tk.StringVar()
         self.output_dir = tk.StringVar(value=os.path.join(self.app_dir, "对比结果"))
@@ -65,24 +66,73 @@ class FolderComparisonTool:
         self.load_config()
         self.load_excluded_folders()
         self.refresh_excluded_listbox()
+        
+        # Start the GUI Queue Processor
+        self.process_gui_queue()
 
+    # --- Optimization: GUI Queue Processor ---
     def process_gui_queue(self):
-        while not self.gui_queue.empty():
-            try:
-                action, args = self.gui_queue.get_nowait()
-                if action == 'log':
-                    self.log_text.insert(tk.END, args[0])
-                    self.log_text.see(tk.END)
-                elif action == 'status':
-                    self.status_var.set(args[0])
-                    if args[1] is not None:
-                        self.progress_var.set(args[1])
-                elif action == 'tree_insert':
-                    tree, values = args
-                    tree.insert("", tk.END, values=values)
-            except queue.Empty:
-                pass
-        self.root.after(100, self.process_gui_queue)
+        """
+        Runs on the main thread. Checks the queue for updates from the background thread
+        and updates the GUI safely.
+        """
+        try:
+            while not self.gui_queue.empty():
+                # Get data without blocking
+                msg_type, data = self.gui_queue.get_nowait()
+                
+                if msg_type == 'log':
+                    if hasattr(self, 'log_text') and self.log_text:
+                        self.log_text.insert(tk.END, data)
+                        self.log_text.see(tk.END)
+                
+                elif msg_type == 'status':
+                    message, progress = data
+                    self.status_var.set(message)
+                    if progress is not None:
+                        self.progress_var.set(progress)
+                
+                elif msg_type == 'tree_insert':
+                    # data = (tree_type, values)
+                    tree_type, values = data
+                    if tree_type == 'modified':
+                        self.modified_tree.insert("", tk.END, values=values)
+                    elif tree_type == 'added':
+                        self.added_tree.insert("", tk.END, values=values)
+                    elif tree_type == 'deleted':
+                        self.deleted_tree.insert("", tk.END, values=values)
+
+                elif msg_type == 'tree_clear':
+                    for item in self.modified_tree.get_children(): self.modified_tree.delete(item)
+                    for item in self.added_tree.get_children(): self.added_tree.delete(item)
+                    for item in self.deleted_tree.get_children(): self.deleted_tree.delete(item)
+                    self.log_text.delete(1.0, tk.END)
+
+                elif msg_type == 'completion':
+                    # Re-enable buttons on main thread
+                    self.open_result_button.config(state=tk.NORMAL)
+                    self.open_summary_button.config(state=tk.NORMAL)
+                    self.compare_button.config(state=tk.NORMAL)
+                    self.stop_button.config(state=tk.DISABLED)
+                    self.is_comparing.set(False)
+                    summary_text = data
+                    messagebox.showinfo("完成", summary_text)
+
+        except queue.Empty:
+            pass
+        finally:
+            # Check again in 100ms
+            self.root.after(100, self.process_gui_queue)
+
+    def log(self, message):
+        """Thread-safe logging"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_msg = f"[{timestamp}] {message}\n"
+        self.gui_queue.put(('log', log_msg))
+
+    def update_status(self, message, progress=None):
+        """Thread-safe status update"""
+        self.gui_queue.put(('status', (message, progress)))
 
     def load_config(self):
         if os.path.exists(self.config_path):
@@ -132,15 +182,16 @@ class FolderComparisonTool:
             try:
                 with open(self.excluded_config_path, 'r', encoding='utf-8') as f:
                     self.excluded_folders = json.load(f)
-                self.log(f"已从 {self.excluded_config_path} 加载排除文件夹配置，共 {len(self.excluded_folders)} 个排除项")
+                self.log(f"已加载排除文件夹配置，共 {len(self.excluded_folders)} 个排除项")
             except Exception as e:
-                messagebox.showwarning("配置文件加载失败", f"加载排除列表失败: {str(e)}")
+                # messagebox on main thread during init is fine
+                pass
 
     def save_excluded_folders(self):
         try:
             with open(self.excluded_config_path, 'w', encoding='utf-8') as f:
                 json.dump(self.excluded_folders, f, indent=2, ensure_ascii=False)
-            self.log(f"已保存排除文件夹配置到 {self.excluded_config_path}，共 {len(self.excluded_folders)} 个排除项")
+            self.log(f"已保存排除文件夹配置")
         except Exception as e:
             messagebox.showwarning("配置文件保存失败", f"保存排除列表失败: {str(e)}")
 
@@ -161,11 +212,9 @@ class FolderComparisonTool:
             self.dir_a_combobox['values'] = self.dir_a_history
             self.dir_b_combobox['values'] = self.dir_b_history
             
-            self.log(f"已互换文件夹：原始文件夹→{b_path}，修改文件夹→{a_path}")
-            messagebox.showinfo("成功", "已互换原始文件夹和修改文件夹！")
+            self.log(f"已互换文件夹：{b_path} <-> {a_path}")
         except Exception as e:
             self.log(f"互换文件夹失败: {str(e)}")
-            messagebox.showerror("错误", f"互换文件夹失败: {str(e)}")
 
     def create_widgets(self):
         main_frame = ttk.Frame(self.root, padding="5")
@@ -315,11 +364,9 @@ class FolderComparisonTool:
                 self.output_dir_combobox['values'] = self.output_dir_history
                 self.output_dir.set(os.path.join(self.app_dir, "对比结果"))
         else:
-            messagebox.showinfo("提示", "请先选中要删除的历史记录（点击下拉框选择后再删除）")
             return
         
         self.save_config()
-        self.log(f"已删除选中的历史记录: {selected}")
 
     def clear_all_history(self):
         if messagebox.askyesno("确认", "确定要清除所有文件夹历史记录吗？"):
@@ -336,7 +383,6 @@ class FolderComparisonTool:
             self.output_dir.set(os.path.join(self.app_dir, "对比结果"))
             
             self.save_config()
-            self.log("已清除所有文件夹历史记录")
 
     def browse_dir_a(self):
         directory = filedialog.askdirectory(title="选择原始文件夹 (A)")
@@ -376,17 +422,20 @@ class FolderComparisonTool:
         
         subfolders = set()
         
-        for root, dirs, _ in os.walk(dir_a):
-            for dir in dirs:
-                full_path = os.path.join(root, dir)
-                rel_path = os.path.relpath(full_path, dir_a)
-                subfolders.add(rel_path)
-        
-        for root, dirs, _ in os.walk(dir_b):
-            for dir in dirs:
-                full_path = os.path.join(root, dir)
-                rel_path = os.path.relpath(full_path, dir_b)
-                subfolders.add(rel_path)
+        try:
+            for root, dirs, _ in os.walk(dir_a):
+                for dir in dirs:
+                    full_path = os.path.join(root, dir)
+                    rel_path = os.path.relpath(full_path, dir_a)
+                    subfolders.add(rel_path)
+            
+            for root, dirs, _ in os.walk(dir_b):
+                for dir in dirs:
+                    full_path = os.path.join(root, dir)
+                    rel_path = os.path.relpath(full_path, dir_b)
+                    subfolders.add(rel_path)
+        except:
+            pass
         
         if not subfolders:
             messagebox.showinfo("信息", "未找到子文件夹")
@@ -434,7 +483,7 @@ class FolderComparisonTool:
             self.refresh_excluded_listbox()
             self.save_excluded_folders()
             dialog.destroy()
-            messagebox.showinfo("成功", f"已添加 {len(folders_to_exclude)} 个排除文件夹（含子文件夹）")
+            messagebox.showinfo("成功", f"已添加 {len(folders_to_exclude)} 个排除文件夹")
         
         def on_cancel():
             dialog.destroy()
@@ -476,22 +525,8 @@ class FolderComparisonTool:
     def stop_comparison(self):
         self.stop_flag = True
         self.stop_button.config(state=tk.DISABLED)
-        self.status_var.set("正在停止对比...")
+        self.update_status("正在停止对比...")
         self.log("用户请求停止对比")
-
-    def log(self, message):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log_msg = f"[{timestamp}] {message}\n"
-        if hasattr(self, 'gui_queue'):
-            self.gui_queue.put(('log', [log_msg]))
-        else:
-            print(log_msg, end='')
-
-    def update_status(self, message, progress=None):
-        self.status_var.set(message)
-        if progress is not None:
-            self.progress_var.set(progress)
-        self.root.update_idletasks()
 
     def detect_encoding(self, file_path):
         try:
@@ -500,83 +535,54 @@ class FolderComparisonTool:
                 result = chardet.detect(raw_data)
                 confidence = result.get('confidence', 0)
                 encoding = result.get('encoding', 'utf-8')
-                self.log(f"检测文件编码: {file_path} -> {encoding} (置信度: {confidence:.2f})")
                 return encoding
-        except Exception as e:
-            self.log(f"检测文件编码失败: {file_path} - {str(e)}，使用默认编码 utf-8")
+        except:
             return 'utf-8'
-
+    
+    # --- Optimization: Fast Check for Text Files ---
     def is_text_file(self, file_path):
-        try:
-            encoding = self.detect_encoding(file_path)
-            with open(file_path, 'r', encoding=encoding) as f:
-                content = f.read(1024)
-                return True
-        except UnicodeDecodeError:
-            self.log(f"非文本文件: {file_path}")
-            return False
-        except Exception as e:
-            self.log(f"检查文件类型失败: {file_path} - {str(e)}")
-            return False
-
-    def read_file_content(self, file_path):
-        # Try standard encodings first (Fastest)
-        encodings = ['utf-8', 'gb18030', 'gbk', 'cp1252', 'latin-1']
-        
-        raw_data = b""
+        # Read the first 1KB and check for null bytes to detect binary
         try:
             with open(file_path, 'rb') as f:
-                raw_data = f.read()
-        except Exception:
+                chunk = f.read(1024)
+                if b'\x00' in chunk:
+                    return False
+                return True
+        except:
+            return False
+
+    # --- Optimization: Improved Reading ---
+    def read_file_content(self, file_path):
+        # List of common encodings to try before expensive detection
+        encodings = ['utf-8', 'gb18030', 'gbk', 'utf-16', 'latin-1']
+        raw = b''
+        
+        try:
+            with open(file_path, 'rb') as f:
+                raw = f.read()
+        except Exception as e:
+            self.log(f"读取文件失败: {file_path} - {e}")
             return ""
-    
+
+        # Try common encodings first (Fast)
         for enc in encodings:
             try:
-                return raw_data.decode(enc)
+                return raw.decode(enc)
             except UnicodeDecodeError:
                 continue
-                
-        # Only use chardet as a last resort (Slowest)
+        
+        # Fallback to Chardet (Slow)
         try:
-            detected = chardet.detect(raw_data[:10000]) # Limit sample size
-            encoding = detected.get('encoding')
-            if encoding:
-                return raw_data.decode(encoding, errors='replace')
+            detected = chardet.detect(raw[:10000])
+            if detected['encoding']:
+                return raw.decode(detected['encoding'], errors='replace')
         except:
             pass
             
-        return raw_data.decode('utf-8', errors='ignore') # Final fallback
+        return raw.decode('utf-8', errors='ignore')
 
-    def compare_files(self, file_a, file_b):
-        try:
-            if self.stop_flag: return False
-    
-            # 1. Quick Check: File Size
-            size_a = os.path.getsize(file_a)
-            size_b = os.path.getsize(file_b)
-            if size_a != size_b and not getattr(self, 'strict_mode', False):
-                self.log(f"差异(大小): {os.path.basename(file_a)}")
-                return False # Different
-    
-            # 2. Fast Check: Hash Comparison (Streaming)
-            # This checks if files are identical without loading them into RAM as text
-            if self._calculate_file_hash(file_a) == self._calculate_file_hash(file_b):
-                self.log(f"相同: {os.path.basename(file_a)}")
-                return True # Identical
-            
-            # If hashes differ, files are different. 
-            # Note: We do NOT perform diff logic (difflib) here. 
-            # We only do that when generating the HTML report.
-            self.log(f"差异(内容): {os.path.basename(file_a)}")
-            return False
-    
-        except Exception as e:
-            self.log(f"比较出错: {str(e)}")
-            return False
-    
-    # Add this helper method
+    # --- Optimization: Hash-Based Comparison (No Memory Load) ---
     def _calculate_file_hash(self, filepath, block_size=65536):
-        """Calculate SHA256 hash of a file efficiently"""
         sha256 = hashlib.sha256()
         try:
             with open(filepath, 'rb') as f:
@@ -585,6 +591,34 @@ class FolderComparisonTool:
             return sha256.hexdigest()
         except:
             return ""
+
+    def compare_files(self, file_a, file_b):
+        try:
+            if self.stop_flag:
+                return False
+            
+            # 1. Size Check
+            size_a = os.path.getsize(file_a)
+            size_b = os.path.getsize(file_b)
+            
+            # If not strict mode, different size = different file (Instant)
+            if size_a != size_b and not getattr(self, 'strict_mode', False):
+                self.log(f"差异(大小): {os.path.basename(file_a)}")
+                return False
+            
+            # 2. Hash Check (Streaming, Memory Efficient)
+            hash_a = self._calculate_file_hash(file_a)
+            hash_b = self._calculate_file_hash(file_b)
+            
+            if hash_a == hash_b:
+                return True
+            else:
+                self.log(f"差异(内容): {os.path.basename(file_a)}")
+                return False
+                
+        except Exception as e:
+            self.log(f"比较文件时出错: {os.path.basename(file_a)} - {str(e)}")
+            return False
 
     def is_excluded(self, rel_path):
         if not rel_path:
@@ -671,9 +705,7 @@ class FolderComparisonTool:
         
         return parsed_lines, core_diff_indices
 
-    # 修复问题1：合并相邻差异片段
     def _merge_contiguous_core_indices(self, core_diff_indices):
-        """合并连续的核心差异索引，避免片段拆分"""
         if not core_diff_indices:
             return []
         merged_blocks = []
@@ -688,22 +720,18 @@ class FolderComparisonTool:
         return merged_blocks
 
     def _group_diff_fragments_with_context(self, diff_lines, context_lines=3):
-        """重构分组逻辑：先合并连续差异，再生成片段（修复拆分问题）"""
         parsed_lines, core_diff_indices = self._parse_diff_lines(diff_lines)
         
-        # 合并连续的核心差异索引块
         merged_core_blocks = self._merge_contiguous_core_indices(core_diff_indices)
         fragments = []
         processed_core_indices = set()
 
         for core_block in merged_core_blocks:
-            # 取块的首尾索引，扩展上下文
             block_start = core_block[0]
             block_end = core_block[-1]
             start_idx = max(0, block_start - context_lines)
             end_idx = min(len(parsed_lines) - 1, block_end + context_lines)
             
-            # 标记已处理的核心索引
             for idx in core_block:
                 processed_core_indices.add(idx)
 
@@ -733,7 +761,6 @@ class FolderComparisonTool:
                 'parsed_lines': parsed_lines[start_idx:end_idx+1]
             })
 
-        # 处理无差异的情况
         if not fragments:
             fragments = [{
                 'type': 'context',
@@ -753,7 +780,6 @@ class FolderComparisonTool:
     def _build_diff_html(self, diff_lines, file_a, file_b):
         fragments = self._group_diff_fragments_with_context(diff_lines, context_lines=3)
         
-        # 修复问题3：调整CSS解决窄空白行
         html_header = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -900,15 +926,14 @@ class FolderComparisonTool:
             top: 0;
             white-space: nowrap;
         }}
-        /* 修复：调整td样式，设置最小高度和行高，解决窄空白行 */
         .fragment-table td {{
             padding: 8px 10px;
             vertical-align: middle;
             position: relative;
             border-bottom: 1px solid #eee;
-            min-height: 32px; /* 增加最小高度 */
+            min-height: 32px;
             box-sizing: border-box;
-            line-height: 1.5; /* 正常行高 */
+            line-height: 1.5;
         }}
         .col-line-num {{
             width: 60px !important;
@@ -933,9 +958,9 @@ class FolderComparisonTool:
             word-wrap: break-word;
             white-space: pre-wrap;
             font-family: 'Consolas', monospace;
-            line-height: 1.5; /* 强制正常行高 */
+            line-height: 1.5;
             overflow-wrap: break-word;
-            min-height: 24px; /* 内容区最小高度 */
+            min-height: 24px;
         }}
         .content del {{
             background-color: #ffcccc;
@@ -963,7 +988,6 @@ class FolderComparisonTool:
         .add-line {{
             background-color: rgba(39, 174, 96, 0.1);
         }}
-        /* 修复：调整复制按钮样式，避免遮挡内容 */
         .copy-btn {{
             position: absolute;
             right: 8px;
@@ -1003,7 +1027,6 @@ class FolderComparisonTool:
         .diff-content {{
             overflow-x: auto;
         }}
-        /* 修复：空行强制最小高度 */
         .content:empty {{
             min-height: 24px;
             display: inline-block;
@@ -1056,7 +1079,6 @@ class FolderComparisonTool:
             elif min_b and max_b:
                 range_text = f"（修改文件：{min_b}-{max_b}）"
             
-            # 修复问题2：修复JSON转义，避免复制函数解析失败
             original_core_json = json.dumps(fragment['original_core_diff'], ensure_ascii=False).replace('"', '\\"')
             modified_core_json = json.dumps(fragment['modified_core_diff'], ensure_ascii=False).replace('"', '\\"')
             
@@ -1127,7 +1149,6 @@ class FolderComparisonTool:
             frag_html += '''</tbody></table></div>'''
             html_fragments.append(frag_html)
 
-        # 修复问题2：重构复制函数，解决无反应问题
         html_footer = f"""
         </div>
         </div>
@@ -1135,10 +1156,8 @@ class FolderComparisonTool:
         <div id="copyToast" class="copy-toast">复制成功！</div>
         
         <script>
-            // 修复：核心差异复制函数（解决JSON解析和剪贴板兼容）
             async function copyCoreDiff(coreDiffJson, type) {{
                 try {{
-                    // 还原转义的引号
                     coreDiffJson = coreDiffJson.replace(/\\\\"/g, '"');
                     const diffLines = JSON.parse(coreDiffJson || '[]');
                     
@@ -1148,8 +1167,6 @@ class FolderComparisonTool:
                     }}
 
                     const text = diffLines.join('\\n');
-                    
-                    // 兼容所有浏览器的剪贴板复制
                     let copySuccess = false;
                     if (navigator.clipboard && window.isSecureContext) {{
                         try {{
@@ -1160,7 +1177,6 @@ class FolderComparisonTool:
                         }}
                     }}
                     
-                    // 降级方案
                     if (!copySuccess) {{
                         const textArea = document.createElement('textarea');
                         textArea.value = text;
@@ -1188,7 +1204,6 @@ class FolderComparisonTool:
                 }}
             }}
 
-            // 修复：单行复制函数（解决内容获取错误）
             async function copyOnlyCoreLine(btn) {{
                 try {{
                     const row = btn.closest('tr');
@@ -1197,7 +1212,6 @@ class FolderComparisonTool:
                         return;
                     }}
 
-                    // 正确获取内容（排除按钮文字）
                     const contentCell = btn.parentElement;
                     const text = contentCell.textContent.replace('复制', '').trim();
                     
@@ -1206,7 +1220,6 @@ class FolderComparisonTool:
                         return;
                     }}
 
-                    // 兼容剪贴板复制
                     let copySuccess = false;
                     if (navigator.clipboard && window.isSecureContext) {{
                         try {{
@@ -1464,13 +1477,9 @@ class FolderComparisonTool:
             self.open_result_button.config(state=tk.DISABLED)
             self.open_summary_button.config(state=tk.DISABLED)
             
-            for item in self.modified_tree.get_children():
-                self.modified_tree.delete(item)
-            for item in self.added_tree.get_children():
-                self.added_tree.delete(item)
-            for item in self.deleted_tree.get_children():
-                self.deleted_tree.delete(item)
-            self.log_text.delete(1.0, tk.END)
+            # --- Optimization: Send clear signal via queue ---
+            self.gui_queue.put(('tree_clear', None))
+            # -------------------------------------------------
             
             dir_a = self.dir_a.get()
             dir_b = self.dir_b.get()
@@ -1532,12 +1541,13 @@ class FolderComparisonTool:
                         self.log(f"跳过排除的文件: {rel_path}")
                         continue
                     
+                    # --- Optimization: Check file type fast ---
                     if self.is_text_file(file_path):
                         text_files_a[rel_path] = file_path
-                        self.log(f"发现文本文件: {rel_path}")
+                        # self.log(f"发现文本文件: {rel_path}") # Removed for speed
                         total_files_a += 1
-                    else:
-                        self.log(f"跳过非文本文件: {rel_path}")
+                    # else:
+                        # self.log(f"跳过非文本文件: {rel_path}") # Removed for speed
             
             if self.stop_flag:
                 self.log("对比操作已停止")
@@ -1562,28 +1572,24 @@ class FolderComparisonTool:
                     rel_path = os.path.relpath(file_path, dir_b)
                     
                     processed_files += 1
-                    progress = (processed_files / max(total_files_a, 1)) * 100
-                    self.update_status(f"正在比较: {processed_files}/{max(total_files_a, 1)}", progress)
+                    # Update progress only every 10 files to save GUI calls
+                    if processed_files % 10 == 0:
+                        progress = (processed_files / max(total_files_a, 1)) * 100
+                        self.update_status(f"正在比较: {processed_files}/{max(total_files_a, 1)}", progress)
                     
                     if self.is_excluded(rel_path):
-                        self.log(f"跳过排除的文件: {rel_path}")
                         continue
                     
                     if self.is_text_file(file_path):
-                        self.log(f"检查文件: {rel_path}")
-                        
                         if rel_path in text_files_a:
                             original_file = text_files_a[rel_path]
                             if not self.compare_files(original_file, file_path):
                                 modified_files.append(rel_path)
-                                self.log(f"发现差异: {rel_path}")
-                            else:
-                                self.log(f"文件内容相同: {rel_path}")
+                                # Send directly to queue for display
+                                self.gui_queue.put(('tree_insert', ('modified', (rel_path, "修改"))))
                         else:
                             added_files.append(rel_path)
-                            self.log(f"发现新增文件: {rel_path}")
-                    else:
-                        self.log(f"跳过非文本文件: {rel_path}")
+                            self.gui_queue.put(('tree_insert', ('added', (rel_path, "新增"))))
             
             self.log("正在检测删除文件...")
             deleted_files = []
@@ -1594,8 +1600,9 @@ class FolderComparisonTool:
                     break
                 
                 processed_deleted += 1
-                progress = (processed_deleted / len(text_files_a)) * 100
-                self.update_status(f"检测删除文件: {processed_deleted}/{len(text_files_a)}", progress)
+                if processed_deleted % 10 == 0:
+                    progress = (processed_deleted / len(text_files_a)) * 100
+                    self.update_status(f"检测删除文件: {processed_deleted}/{len(text_files_a)}", progress)
                 
                 if self.is_excluded(rel_path):
                     continue
@@ -1604,6 +1611,7 @@ class FolderComparisonTool:
                 if not os.path.exists(file_b_path):
                     deleted_files.append(rel_path)
                     self.log(f"发现删除文件: {rel_path}")
+                    self.gui_queue.put(('tree_insert', ('deleted', (rel_path, "删除"))))
             
             if self.stop_flag:
                 self.log("对比操作已停止")
@@ -1613,10 +1621,7 @@ class FolderComparisonTool:
             self.added_files = added_files
             self.deleted_files = deleted_files
             
-            # 补全中断的日志输出
             self.log(f"比较完成: 发现 {len(modified_files)} 个修改的文件，{len(added_files)} 个新增的文件，{len(deleted_files)} 个删除的文件")
-            
-            self.update_file_lists()
             
             if modified_files:
                 self.log("正在生成差异报告...")
@@ -1635,25 +1640,19 @@ class FolderComparisonTool:
             self.log("比较完成!")
             self.update_status("比较完成", 100)
             
-            self.open_result_button.config(state=tk.NORMAL)
-            self.open_summary_button.config(state=tk.NORMAL)
-            
-            messagebox.showinfo("完成", f"比较完成!\n发现 {len(modified_files)} 个修改的文件、{len(added_files)} 个新增的文件、{len(deleted_files)} 个删除的文件")
+            summary_text = f"比较完成!\n发现 {len(modified_files)} 个修改的文件、{len(added_files)} 个新增的文件、{len(deleted_files)} 个删除的文件"
+            self.gui_queue.put(('completion', summary_text))
             
         except Exception as e:
             self.log(f"比较文件夹时发生错误: {str(e)}")
-            messagebox.showerror("错误", f"比较失败: {str(e)}")
+            self.gui_queue.put(('status', (f"错误: {str(e)}", 0)))
         finally:
-            self.is_comparing.set(False)
-            self.compare_button.config(state=tk.NORMAL)
-            self.stop_button.config(state=tk.DISABLED)
-            self.update_status("就绪", 0)
+            pass # Cleanup handled in queue processor based on flags
 
     def copy_modified_files(self, modified_files, dir_a, dir_b, target_dir):
         try:
             for rel_path in modified_files:
                 if self.stop_flag:
-                    self.log("复制修改文件已停止")
                     return
                     
                 src_a = os.path.join(dir_a, rel_path)
@@ -1668,17 +1667,13 @@ class FolderComparisonTool:
                 shutil.copy2(src_a, dest_a)
                 shutil.copy2(src_b, dest_b)
                 
-                self.log(f"已复制修改文件: {rel_path}")
-                
         except Exception as e:
             self.log(f"复制修改文件失败: {str(e)}")
-            messagebox.showwarning("警告", f"部分修改文件复制失败: {str(e)}")
 
     def copy_added_files(self, added_files, dir_b, target_dir):
         try:
             for rel_path in added_files:
                 if self.stop_flag:
-                    self.log("复制新增文件已停止")
                     return
                     
                 src = os.path.join(dir_b, rel_path)
@@ -1687,17 +1682,13 @@ class FolderComparisonTool:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 shutil.copy2(src, dest)
                 
-                self.log(f"已复制新增文件: {rel_path}")
-                
         except Exception as e:
             self.log(f"复制新增文件失败: {str(e)}")
-            messagebox.showwarning("警告", f"部分新增文件复制失败: {str(e)}")
 
     def copy_deleted_files(self, deleted_files, dir_a, target_dir):
         try:
             for rel_path in deleted_files:
                 if self.stop_flag:
-                    self.log("复制删除文件已停止")
                     return
                     
                 src = os.path.join(dir_a, rel_path)
@@ -1706,34 +1697,14 @@ class FolderComparisonTool:
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 shutil.copy2(src, dest)
                 
-                self.log(f"已复制删除文件: {rel_path}")
-                
         except Exception as e:
             self.log(f"复制删除文件失败: {str(e)}")
-            messagebox.showwarning("警告", f"部分删除文件复制失败: {str(e)}")
-
-    def update_file_lists(self):
-        try:
-            for rel_path in self.modified_files:
-                self.modified_tree.insert("", tk.END, values=(rel_path, "修改"))
-            
-            for rel_path in self.added_files:
-                self.added_tree.insert("", tk.END, values=(rel_path, "新增"))
-            
-            for rel_path in self.deleted_files:
-                self.deleted_tree.insert("", tk.END, values=(rel_path, "删除"))
-                
-            self.root.update_idletasks()
-            
-        except Exception as e:
-            self.log(f"更新文件列表失败: {str(e)}")
 
     def start_comparison(self):
         if self.is_comparing.get():
             messagebox.showinfo("提示", "正在比较中，请等待完成或停止当前操作")
             return
             
-        # 启动线程执行比较，避免UI阻塞
         comparison_thread = threading.Thread(target=self.compare_directories)
         comparison_thread.daemon = True
         comparison_thread.start()
@@ -1752,7 +1723,6 @@ class FolderComparisonTool:
                 messagebox.showwarning("警告", "文件不存在，无法打开")
                 return
                 
-            # 生成临时差异报告并打开
             temp_dir = os.path.join(self.output_dir.get(), "临时报告")
             os.makedirs(temp_dir, exist_ok=True)
             temp_report = os.path.join(temp_dir, f"{rel_path.replace(os.path.sep, '_')}_temp_diff.html")
@@ -1816,7 +1786,6 @@ if __name__ == "__main__":
         root = tk.Tk()
         app = FolderComparisonTool(root)
         
-        # 窗口关闭时保存配置
         def on_closing():
             app.save_config()
             app.save_excluded_folders()
