@@ -14,6 +14,7 @@ import webbrowser
 import threading
 import chardet
 import re
+import queue
 
 def get_app_dir(app_name="FolderComparisonTool"):
     if getattr(sys, "frozen", False):
@@ -28,6 +29,9 @@ class FolderComparisonTool:
         self.root.geometry("900x700")
         self.root.minsize(700, 700)
         
+		self.gui_queue = queue.Queue()
+		self.root.after(100, self.process_gui_queue) # Start checking queue
+		
         self.default_font = ('SimHei', 10)
         self.header_font = ('SimHei', 12, 'bold')
         
@@ -61,6 +65,24 @@ class FolderComparisonTool:
         self.load_config()
         self.load_excluded_folders()
         self.refresh_excluded_listbox()
+
+    def process_gui_queue(self):
+        while not self.gui_queue.empty():
+            try:
+                action, args = self.gui_queue.get_nowait()
+                if action == 'log':
+                    self.log_text.insert(tk.END, args[0])
+                    self.log_text.see(tk.END)
+                elif action == 'status':
+                    self.status_var.set(args[0])
+                    if args[1] is not None:
+                        self.progress_var.set(args[1])
+                elif action == 'tree_insert':
+                    tree, values = args
+                    tree.insert("", tk.END, values=values)
+            except queue.Empty:
+                pass
+        self.root.after(100, self.process_gui_queue)
 
     def load_config(self):
         if os.path.exists(self.config_path):
@@ -460,9 +482,8 @@ class FolderComparisonTool:
     def log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_msg = f"[{timestamp}] {message}\n"
-        if hasattr(self, 'log_text') and self.log_text:
-            self.log_text.insert(tk.END, log_msg)
-            self.log_text.see(tk.END)
+        if hasattr(self, 'gui_queue'):
+            self.gui_queue.put(('log', [log_msg]))
         else:
             print(log_msg, end='')
 
@@ -499,92 +520,71 @@ class FolderComparisonTool:
             return False
 
     def read_file_content(self, file_path):
+        # Try standard encodings first (Fastest)
+        encodings = ['utf-8', 'gb18030', 'gbk', 'cp1252', 'latin-1']
+        
+        raw_data = b""
         try:
-            encoding = self.detect_encoding(file_path)
-            with open(file_path, 'r', encoding=encoding) as f:
-                content = f.read()
-                self.log(f"成功读取文件内容: {file_path} (编码: {encoding}, 大小: {len(content)} 字节)")
-                return content
-        except UnicodeDecodeError as ude:
-            self.log(f"使用 {encoding} 编码读取失败: {file_path} - {str(ude)}")
-            for alt_encoding in ['gbk', 'gb2312', 'latin-1']:
-                try:
-                    with open(file_path, 'r', encoding=alt_encoding) as f:
-                        content = f.read()
-                        self.log(f"使用备用编码 {alt_encoding} 成功读取文件: {file_path}")
-                        return content
-                except UnicodeDecodeError:
-                    continue
-            self.log(f"无法读取文件内容: {file_path}，所有尝试的编码都失败")
+            with open(file_path, 'rb') as f:
+                raw_data = f.read()
+        except Exception:
             return ""
-        except Exception as e:
-            self.log(f"读取文件内容失败: {file_path} - {str(e)}")
-            return ""
+    
+        for enc in encodings:
+            try:
+                return raw_data.decode(enc)
+            except UnicodeDecodeError:
+                continue
+                
+        # Only use chardet as a last resort (Slowest)
+        try:
+            detected = chardet.detect(raw_data[:10000]) # Limit sample size
+            encoding = detected.get('encoding')
+            if encoding:
+                return raw_data.decode(encoding, errors='replace')
+        except:
+            pass
+            
+        return raw_data.decode('utf-8', errors='ignore') # Final fallback
 
     def compare_files(self, file_a, file_b):
         try:
-            self.log(f"开始比较文件: {file_a} 和 {file_b}")
-            
-            if self.stop_flag:
-                return False
-            
+            if self.stop_flag: return False
+    
+            # 1. Quick Check: File Size
             size_a = os.path.getsize(file_a)
             size_b = os.path.getsize(file_b)
+            if size_a != size_b and not getattr(self, 'strict_mode', False):
+                self.log(f"差异(大小): {os.path.basename(file_a)}")
+                return False # Different
+    
+            # 2. Fast Check: Hash Comparison (Streaming)
+            # This checks if files are identical without loading them into RAM as text
+            if self._calculate_file_hash(file_a) == self._calculate_file_hash(file_b):
+                self.log(f"相同: {os.path.basename(file_a)}")
+                return True # Identical
             
-            self.log(f"文件大小: {file_a} ({size_a} 字节), {file_b} ({size_b} 字节)")
-            
-            if not hasattr(self, 'strict_mode'):
-                self.strict_mode = False
-                
-            if size_a != size_b and not self.strict_mode:
-                self.log(f"文件大小不同，判定为有差异: {file_a} 和 {file_b}")
-                return False
-            
-            content_a = self.read_file_content(file_a)
-            content_b = self.read_file_content(file_b)
-            
-            if self.stop_flag:
-                return False
-            
-            len_a = len(content_a)
-            len_b = len(content_b)
-            
-            self.log(f"内容长度: {file_a} ({len_a} 字符), {file_b} ({len_b} 字符)")
-            
-            if len_a != len_b and not self.strict_mode:
-                self.log(f"内容长度不同，判定为有差异: {file_a} 和 {file_b}")
-                return False
-            
-            if self.ignore_whitespace.get():
-                processed_a = ''.join(content_a.split())
-                processed_b = ''.join(content_b.split())
-                self.log(f"忽略空白字符后，内容长度: {file_a} ({len(processed_a)} 字符), {file_b} ({len(processed_b)} 字符)")
-            else:
-                processed_a = content_a
-                processed_b = content_b
-            
-            if self.ignore_case.get():
-                processed_a = processed_a.lower()
-                processed_b = processed_b.lower()
-            
-            diff = list(difflib.unified_diff(
-                processed_a.splitlines(), 
-                processed_b.splitlines(), 
-                lineterm='',
-                n=0
-            ))
-            
-            if len(diff) > 2:
-                self.log(f"发现 {len(diff)-2} 处差异")
-                for line in diff[2:]:
-                    self.log(f"差异: {line.strip()}")
-                return False
-            
-            self.log(f"文件内容相同: {file_a} 和 {file_b}")
-            return True
-        except Exception as e:
-            self.log(f"比较文件时出错: {file_a} 和 {file_b} - {str(e)}")
+            # If hashes differ, files are different. 
+            # Note: We do NOT perform diff logic (difflib) here. 
+            # We only do that when generating the HTML report.
+            self.log(f"差异(内容): {os.path.basename(file_a)}")
             return False
+    
+        except Exception as e:
+            self.log(f"比较出错: {str(e)}")
+            return False
+    
+    # Add this helper method
+    def _calculate_file_hash(self, filepath, block_size=65536):
+        """Calculate SHA256 hash of a file efficiently"""
+        sha256 = hashlib.sha256()
+        try:
+            with open(filepath, 'rb') as f:
+                for block in iter(lambda: f.read(block_size), b''):
+                    sha256.update(block)
+            return sha256.hexdigest()
+        except:
+            return ""
 
     def is_excluded(self, rel_path):
         if not rel_path:
